@@ -1,0 +1,145 @@
+name: Build MAX35 AURORA 4G - SpotPear Factory Base
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Official SpotPear MAX35 source package. The English factory guide links
+  # this exact Google Drive file as xiaozhi-esp32-3.1.0 / xiaozhi-esp32.zip.
+  # We deliberately build this vendor tree with ESP-IDF 5.5 instead of
+  # transplanting MAX35 hardware into the latest 78 upstream.
+  SPOTPEAR_SOURCE_DRIVE_ID: 1WIrLLpS7OxHll7KD5v6kePZM50hAtzlf
+  FIXED_OTA_URL: http://124.221.112.55:8002/xiaozhi/ota/
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: espressif/idf:v5.5
+
+    steps:
+      - name: Checkout product UI patch
+        uses: actions/checkout@v4
+        with:
+          path: product
+
+      - name: Prepare ESP-IDF 5.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          idf.py --version
+          python --version
+          python -m pip install --disable-pip-version-check --no-cache-dir gdown
+
+      - name: Download SpotPear factory source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          rm -rf factory-src /tmp/spotpear-max35.zip
+          mkdir -p factory-src
+          python -m gdown "${SPOTPEAR_SOURCE_DRIVE_ID}" -O /tmp/spotpear-max35.zip
+          python - <<'PY'
+          import zipfile
+          p = '/tmp/spotpear-max35.zip'
+          if not zipfile.is_zipfile(p):
+              raise SystemExit('Downloaded SpotPear source is not a ZIP')
+          print('SpotPear factory source ZIP: OK')
+          PY
+          unzip -q /tmp/spotpear-max35.zip -d factory-src
+          FACTORY_ROOT="$(python product/scripts/find_source_root.py factory-src)"
+          echo "FACTORY_ROOT=$FACTORY_ROOT" >> "$GITHUB_ENV"
+          echo "Factory source root: $FACTORY_ROOT"
+          test -d "$FACTORY_ROOT/main/boards/sp-esp32-s3-lcd-3.5"
+
+      - name: Apply UI and fixed OTA only
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          python product/scripts/patch_spotpear_factory.py \
+            --factory "$FACTORY_ROOT" \
+            --product product
+          echo "Documented ML307 symbol: $(cat "$FACTORY_ROOT/.aurora_factory_board_symbol")"
+          echo "Required factory options:"
+          cat "$FACTORY_ROOT/.aurora_factory_required_symbols"
+
+      - name: Configure exact SpotPear 4G factory board
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          cd "$FACTORY_ROOT"
+          rm -rf build sdkconfig sdkconfig.old
+          idf.py set-target esp32s3
+          python "$GITHUB_WORKSPACE/product/scripts/configure_factory_sdkconfig.py" .
+          idf.py reconfigure
+          python "$GITHUB_WORKSPACE/product/scripts/preflight_factory.py" .
+          echo '--- selected board / OTA / camera config ---'
+          grep -E 'SPOTPEAR|ML307|OTA_URL|CAMERA_GC0308|CAMERA_IMAGE_ROTATION|ESPTOOLPY_FLASHSIZE' sdkconfig || true
+
+      - name: Build untouched factory stack plus AURORA UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          cd "$FACTORY_ROOT"
+          idf.py build
+
+      - name: Create complete 0x0 merged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          cd "$FACTORY_ROOT"
+          if idf.py merge-bin -o build/merged-binary.bin; then
+            echo 'idf.py merge-bin succeeded'
+          else
+            echo 'idf.py merge-bin unavailable; using flasher_args.json fallback'
+            python "$GITHUB_WORKSPACE/product/scripts/merge_factory_bin.py" .
+          fi
+          test -s build/merged-binary.bin
+
+      - name: Package firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '\r\n' < product/VERSION)"
+          mkdir -p product/dist
+          cp "$FACTORY_ROOT/build/merged-binary.bin" "product/dist/MAX35_AURORA_FACTORY_4G_${VERSION}_merged-binary.bin"
+          cp "$FACTORY_ROOT/sdkconfig" product/dist/sdkconfig.final
+          cp "$FACTORY_ROOT/build/flasher_args.json" product/dist/ 2>/dev/null || true
+          BOARD_SYMBOL="$(tr -d '\r\n' < "$FACTORY_ROOT/.aurora_factory_board_symbol")"
+          REQUIRED_SYMBOLS="$(paste -sd, "$FACTORY_ROOT/.aurora_factory_required_symbols")"
+          {
+            echo "product_version=$VERSION"
+            echo "base=SpotPear factory Xiaozhi source (not current 78 upstream)"
+            echo "hardware=ESP32S3-MAX35-4G rear-camera finished unit"
+            echo "factory_board_prompt=Spotpear ESP32-S3-3.5-LCD-cam-ML307"
+            echo "factory_ml307_symbol=$BOARD_SYMBOL"
+            echo "factory_required_symbols=$REQUIRED_SYMBOLS"
+            echo "network=vendor ML307 implementation unchanged"
+            echo "audio=vendor implementation unchanged"
+            echo "camera=vendor implementation; configured rear GC0308/YUV422/90deg"
+            echo "touch=vendor implementation unchanged"
+            echo "ui=AURORA home + dedicated dialog + full wrap + readable slow scroll"
+            echo "ota_url=${FIXED_OTA_URL}"
+            echo "ota_policy=fixed-in-firmware; runtime NVS override disabled"
+            echo "idf=ESP-IDF 5.5 (SpotPear documented factory build line)"
+            echo "flash_address=0x0"
+            echo "build_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > product/dist/BUILD_INFO.txt
+          (cd product/dist && sha256sum *.bin > SHA256SUMS.txt)
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAX35-AURORA-SpotPear-Factory-4G-Firmware
+          path: product/dist/
+          if-no-files-found: error
+          retention-days: 30
